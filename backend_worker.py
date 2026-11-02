@@ -438,7 +438,8 @@ class BackendWorker:
         self.log("JADX is decompiling in the background - the Java pane updates when it finishes.", "info")
 
         def work() -> None:
-            self.run_cmd([jadx, "-d", str(jdir), "--no-res", "--show-bad-code", "-q", str(apk)], quiet=True)
+            self.run_cmd([jadx, "-d", str(jdir), "--no-res", "--show-bad-code", "--add-debug-lines", "-q",
+                          str(apk)], quiet=True)
             if (jdir / "sources").exists():
                 self.jadx_dir = jdir
                 self.log("JADX finished - Java view is now real decompiled code.", "ok")

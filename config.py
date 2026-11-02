@@ -20,7 +20,7 @@ from typing import Optional
 #  Application constants
 # --------------------------------------------------------------------------- #
 APP_NAME = "SmaliX Desktop"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 IS_WIN = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0  # hide console windows of child processes
 

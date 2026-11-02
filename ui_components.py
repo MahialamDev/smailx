@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import tkinter as tk
+from bisect import bisect_right
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Callable, Optional
@@ -125,6 +126,244 @@ class LineNumbers(tk.Canvas):
             pass
 
 
+def reveal_line_center(text: tk.Text, line: int, index: Optional[str] = None) -> None:
+    """Scroll `text` so that `line` sits in the middle of the view (like revealLineInCenter)."""
+    total = max(1, int(text.index("end-1c").split(".")[0]))
+    text.yview_moveto(max(0.0, (line - 1) / total))
+    try:
+        text.update_idletasks()
+        info = text.dlineinfo(f"{line}.0")
+        visible = max(1, text.winfo_height() // max(1, info[3] if info else 16))
+        text.yview_moveto(max(0.0, (line - 1 - visible // 2) / total))
+        text.see(index or f"{line}.0")          # also brings the match into view horizontally
+    except tk.TclError:
+        pass
+
+
+class FindBar(tk.Frame):
+    """
+    Compact Ctrl+F bar attached to a CodeText.
+
+      * live search while typing (plain text or regex, optional case sensitivity)
+      * "N of M" counter, up/down buttons, Enter / Shift+Enter, Up / Down keys, Esc to close
+      * every match gets a light background, the active match a stronger one
+      * jumping to a match centres its line and blinks that line for ~1.6 s
+      * `matches` holds (start, end, line) tuples and `matching_lines` the sorted line numbers
+
+    It only reads the text and adds tags, so it also works on the read-only Java view.
+    """
+    MAX_MATCHES = 5000
+    BLINK_FLASHES = 4
+    BLINK_INTERVAL = 200          # ms  -> 4 flashes * 2 * 200 ms = 1.6 s
+
+    def __init__(self, parent, text: tk.Text, anchor: tk.Widget) -> None:
+        super().__init__(parent, bg=C["panel"])
+        self.text, self.anchor = text, anchor
+        self.visible = False
+        self.matches: list = []
+        self.matching_lines: list = []
+        self.current = -1
+        self._capped = False
+        self._sig = None
+        self._job = self._blink_job = self._refresh_job = None
+
+        # priority: findmatch < findcur < findblink (all above the current-line tag)
+        text.tag_configure("findmatch", background="#3d3a1e")
+        text.tag_configure("findcur", background="#b7791f")
+        text.tag_configure("findblink", background="#2563eb")
+        text.tag_raise("sel")
+
+        self.query = tk.StringVar()
+        self.case_var = tk.BooleanVar(value=False)
+        self.regex_var = tk.BooleanVar(value=False)
+
+        row = tk.Frame(self, bg=C["panel"])
+        row.pack(fill="x", padx=8, pady=4)
+        self.entry = ctk.CTkEntry(row, textvariable=self.query, width=230, height=26, font=UI_FONT,
+                                  placeholder_text="Find", fg_color="#0b0e15", border_color=C["border"])
+        self.entry.pack(side="left")
+        self.counter = tk.Label(row, text="0 of 0", width=12, fg=C["dim"], bg=C["panel"], font=UI_FONT)
+        self.counter.pack(side="left", padx=(8, 4))
+        for label, cmd in (("\u25b2", self.prev), ("\u25bc", self.next)):
+            ctk.CTkButton(row, text=label, width=28, height=26, corner_radius=4, font=(UI_FONT[0], 9),
+                          fg_color="#0b0e15", hover_color="#1b2230", border_width=1,
+                          border_color=C["border"], text_color=C["fg"], command=cmd).pack(side="left", padx=(0, 4))
+        self._toggle(row, "Aa", self.case_var)
+        self._toggle(row, ".*", self.regex_var)
+        ctk.CTkButton(row, text="\u2715", width=28, height=26, corner_radius=4, font=(UI_FONT[0], 9),
+                      fg_color="#0b0e15", hover_color="#3b1d1d", text_color=C["fg"],
+                      command=self.close).pack(side="right")
+
+        self.query.trace_add("write", lambda *_: self._schedule())
+        self.entry.bind("<Return>", lambda e: (self.next(), "break")[1])
+        self.entry.bind("<Shift-Return>", lambda e: (self.prev(), "break")[1])
+        self.entry.bind("<Down>", lambda e: (self.next(), "break")[1])
+        self.entry.bind("<Up>", lambda e: (self.prev(), "break")[1])
+        self.entry.bind("<Escape>", lambda e: (self.close(), "break")[1])
+
+    # -- construction helpers ------------------------------------------------
+    def _toggle(self, row, label: str, var: tk.BooleanVar) -> None:
+        def paint() -> None:
+            on = var.get()
+            btn.configure(fg_color=C["accent"] if on else "#0b0e15", text_color="#05080f" if on else C["fg"])
+
+        def click() -> None:
+            var.set(not var.get())
+            paint()
+            self._run()
+
+        btn = ctk.CTkButton(row, text=label, width=32, height=26, corner_radius=4,
+                            font=(UI_FONT[0], 9, "bold"), border_width=1, border_color=C["border"],
+                            fg_color="#0b0e15", hover_color="#1b2230", text_color=C["fg"], command=click)
+        btn.pack(side="left", padx=(6, 0))
+
+    def _set_counter(self, text: str, ok: bool = True) -> None:
+        self.counter.configure(text=text, fg=C["fg"] if ok else C["red"])
+
+    # -- show / hide -----------------------------------------------------------
+    def show(self) -> None:
+        if not self.visible:
+            self.pack(side="top", fill="x", before=self.anchor)
+            self.visible = True
+        try:                                   # pre-fill with a short single-line selection
+            sel = self.text.get("sel.first", "sel.last")
+            if sel and "\n" not in sel and len(sel) <= 120:
+                self.query.set(sel)
+        except tk.TclError:
+            pass
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+        if self.query.get():
+            self._run()
+
+    def close(self) -> None:
+        for job in (self._job, self._blink_job, self._refresh_job):
+            if job:
+                self.after_cancel(job)
+        self._job = self._blink_job = self._refresh_job = None
+        for tag in ("findmatch", "findcur", "findblink"):
+            self.text.tag_remove(tag, "1.0", "end")
+        self.matches, self.matching_lines, self.current = [], [], -1
+        self.pack_forget()
+        self.visible = False
+        self.text.focus_set()
+
+    # -- searching -------------------------------------------------------------
+    def _schedule(self) -> None:
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(120, self._run)
+
+    def _run(self, reveal: bool = True, keep_start: Optional[tuple] = None) -> None:
+        """Re-compute all matches for the current query and highlight them."""
+        if self._job:
+            self.after_cancel(self._job)
+            self._job = None
+        t = self.text
+        for tag in ("findmatch", "findcur"):
+            t.tag_remove(tag, "1.0", "end")
+        self.matches, self.matching_lines, self.current, self._capped = [], [], -1, False
+        q = self.query.get()
+        if not q:
+            self._set_counter("0 of 0")
+            return
+        flags = re.MULTILINE | (0 if self.case_var.get() else re.IGNORECASE)
+        try:
+            pattern = re.compile(q if self.regex_var.get() else re.escape(q), flags)
+        except re.error:
+            self._set_counter("bad regex", ok=False)
+            return
+
+        content = t.get("1.0", "end-1c")
+        self._sig = (len(content), hash(content))
+        starts = [0] + [m.end() for m in re.finditer("\n", content)]   # char offset of every line start
+        lines = set()
+        for m in pattern.finditer(content):
+            if m.end() == m.start():
+                continue
+            sl = bisect_right(starts, m.start())
+            el = bisect_right(starts, m.end())
+            s_idx = f"{sl}.{m.start() - starts[sl - 1]}"
+            e_idx = f"{el}.{m.end() - starts[el - 1]}"
+            t.tag_add("findmatch", s_idx, e_idx)
+            self.matches.append((s_idx, e_idx, sl))
+            lines.add(sl)
+            if len(self.matches) >= self.MAX_MATCHES:
+                self._capped = True
+                break
+        self.matching_lines = sorted(lines)
+        if not self.matches:
+            self._set_counter("0 of 0", ok=False)
+            return
+
+        def pos(idx: str) -> tuple:
+            a, b = idx.split(".")
+            return int(a), int(b)
+
+        anchor = keep_start or pos(t.index("insert"))
+        start_i = next((i for i, mt in enumerate(self.matches) if pos(mt[0]) >= anchor), 0)
+        self._select(start_i, reveal=reveal)
+
+    def _select(self, i: int, reveal: bool = True) -> None:
+        t = self.text
+        t.tag_remove("findcur", "1.0", "end")
+        self.current = i
+        s_idx, e_idx, line = self.matches[i]
+        t.tag_add("findcur", s_idx, e_idx)
+        n = len(self.matches)
+        self._set_counter(f"{i + 1} of {n}{'+' if self._capped else ''}")
+        if reveal:
+            t.mark_set("insert", s_idx)
+            reveal_line_center(t, line, s_idx)
+            self._blink(line)
+
+    def next(self) -> None:
+        if self.matches:
+            self._select((self.current + 1) % len(self.matches))
+
+    def prev(self) -> None:
+        if self.matches:
+            self._select((self.current - 1) % len(self.matches))
+
+    # -- keep results in sync with edits / file switches -------------------------------
+    def refresh(self) -> None:
+        """Re-run the search if the text changed (no jumping, no blinking)."""
+        if not self.visible or not self.query.get():
+            return
+        content = self.text.get("1.0", "end-1c")
+        if self._sig == (len(content), hash(content)):
+            return
+        keep = None
+        if 0 <= self.current < len(self.matches):
+            a, b = self.matches[self.current][0].split(".")
+            keep = (int(a), int(b))
+        self._run(reveal=False, keep_start=keep)
+
+    def schedule_refresh(self) -> None:
+        if self.visible:
+            if self._refresh_job:
+                self.after_cancel(self._refresh_job)
+            self._refresh_job = self.after(350, self.refresh)
+
+    # -- blink -------------------------------------------------------------------
+    def _blink(self, line: int) -> None:
+        """Flash the whole matched line for ~1.6 s so it draws attention."""
+        if self._blink_job:
+            self.after_cancel(self._blink_job)
+            self._blink_job = None
+        t = self.text
+
+        def step(n: int) -> None:
+            t.tag_remove("findblink", "1.0", "end")
+            if n >= self.BLINK_FLASHES * 2:
+                self._blink_job = None
+                return
+            if n % 2 == 0:
+                t.tag_add("findblink", f"{line}.0", f"{line}.0 lineend+1c")
+            self._blink_job = self.after(self.BLINK_INTERVAL, step, n + 1)
+        step(0)
+
+
 def make_panel(parent, title: str, hint: str = "") -> tuple:
     outer = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
     inner = tk.Frame(outer, bg=C["panel"])
@@ -161,7 +400,7 @@ def make_code_text(parent, wrap: str = "none", gutter: bool = False) -> tuple:
 
 
 class CodePane:
-    """A titled panel holding a syntax-highlighted editor (`mode` = 'java' | 'smali')."""
+    """A titled panel holding a syntax-highlighted editor (`mode` = 'java' | 'smali') with Ctrl+F find."""
 
     def __init__(self, parent, title: str, hint: str, mode: str, editable: bool) -> None:
         self.mode, self.editable = mode, editable
@@ -171,6 +410,26 @@ class CodePane:
         configure_tags(self.text, mode)
         if not editable:
             self.text.configure(state="disabled")
+
+        # in-editor "Find & Jump" (created after configure_tags so its tags get higher priority)
+        self.find = FindBar(body, self.text, anchor=frame)
+        for seq in ("<Control-f>", "<Control-F>"):
+            self.text.bind(seq, self._on_ctrl_f)
+        self.text.bind("<F3>", lambda e: (self.find.next(), "break")[1])
+        self.text.bind("<Shift-F3>", lambda e: (self.find.prev(), "break")[1])
+        self.text.bind("<Escape>", self._on_escape)
+        # a read-only (disabled) Text does not take focus on click by default - Ctrl+F needs it
+        self.text.bind("<Button-1>", lambda e: self.text.focus_set(), add="+")
+
+    def _on_ctrl_f(self, _e=None) -> str:
+        self.find.show()
+        return "break"
+
+    def _on_escape(self, _e=None) -> Optional[str]:
+        if self.find.visible:
+            self.find.close()
+            return "break"
+        return None
 
     def set_content(self, content: str, syntax: bool = True) -> None:
         t = self.text
@@ -185,6 +444,7 @@ class CodePane:
             clear_syntax(t)
         if not self.editable:
             t.configure(state="disabled")
+        self.find.refresh()                    # keep an open find bar in sync with the new text
 
     def rehighlight(self) -> None:
         highlight(self.text, self.mode)
@@ -210,7 +470,8 @@ class Header(tk.Frame):
 class Toolbar(tk.Frame):
     """commands keys: open save rebuild sign rebuild_sign clean about tools search(query)"""
 
-    def __init__(self, parent, commands: dict, fast_var: tk.BooleanVar, random_var: tk.BooleanVar) -> None:
+    def __init__(self, parent, commands: dict, fast_var: tk.BooleanVar, random_var: tk.BooleanVar,
+                 sync_var: tk.BooleanVar) -> None:
         super().__init__(parent, bg=C["bg"])
         self.action_buttons: list = []
 
@@ -232,7 +493,8 @@ class Toolbar(tk.Frame):
         add("rebuild_sign", "Rebuild - Sign", C["green"], "#1aa04d", "#04140a")
         add("clean", "Clean", "#0b0e15", "#1b2230", "#ffffff", border=True)
 
-        for text, var in (("fast (code-only)", fast_var), ("random key", random_var)):
+        for text, var in (("fast (code-only)", fast_var), ("random key", random_var),
+                          ("sync java\u2192smali", sync_var)):
             ctk.CTkCheckBox(self, text=text, variable=var, width=20, checkbox_width=16, checkbox_height=16,
                             border_width=1, corner_radius=3, fg_color=C["accent"], hover_color="#17a898",
                             text_color=C["dim"], font=(UI_FONT[0], 9)).pack(side="left", padx=(8, 0))

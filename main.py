@@ -27,8 +27,9 @@ from backend_worker import BackendWorker
 from config import APP_DIR, APP_NAME, APP_VERSION, C, Tools
 from smali_utils import (explain_line, flip_if_line, is_binary, parse_method_header, read_text,
                          return_patch_body, smali_class_name, smali_to_java_outline)
+from sync_mapper import map_java_to_smali
 from ui_components import (BottomTabs, CodePane, Header, ProjectTree, StatusBar, Toolbar,
-                           ToolsDialog, apply_styles)
+                           ToolsDialog, apply_styles, reveal_line_center)
 
 MAX_EDIT_BYTES = 5 * 1024 * 1024
 
@@ -49,10 +50,14 @@ class SmaliXApp(ctk.CTk):
         self.backend.on_jadx_ready = self._reload_java
 
         self.current_file: Optional[Path] = None
+        self._java_owner: Optional[Path] = None   # smali file whose Java is shown
         self._hl_job = None
+        self._blink_job = None
         self._callers_cache: dict = {}
         self.fast_var = tk.BooleanVar(value=False)
         self.random_var = tk.BooleanVar(value=False)
+        self.sync_var = tk.BooleanVar(value=True)
+        self._active_pane = None            # last focused editor pane (target of Ctrl+F)
 
         apply_styles(self)
         self._build_ui()
@@ -71,7 +76,7 @@ class SmaliXApp(ctk.CTk):
             "open": self.cmd_open, "save": self.cmd_save, "rebuild": self.cmd_rebuild,
             "sign": self.cmd_sign, "rebuild_sign": self.cmd_rebuild_sign, "clean": self.cmd_clean,
             "about": self.cmd_about, "tools": self.cmd_tools, "search": self.cmd_search,
-        }, self.fast_var, self.random_var)
+        }, self.fast_var, self.random_var, self.sync_var)
         self.toolbar.pack(fill="x", padx=16, pady=10)
 
         self.vpane = tk.PanedWindow(self, orient="vertical", sashwidth=6, bg=C["bg"], bd=0,
@@ -82,12 +87,19 @@ class SmaliXApp(ctk.CTk):
         self.vpane.add(self.hpane, minsize=220, stretch="always")
 
         self.project_tree = ProjectTree(self.hpane, self._on_tree_select, self._on_classes_ready)
-        self.java = CodePane(self.hpane, "JAVA", "decompiled (JADX)", mode="java", editable=False)
+        self.java = CodePane(self.hpane, "JAVA", "decompiled (JADX) \u00b7 click a line to jump to its smali",
+                             mode="java", editable=False)
         self.smali = CodePane(self.hpane, "SMALI", "editable \u00b7 click a line to explain",
                               mode="smali", editable=True)
         self.hpane.add(self.project_tree.outer, minsize=180, stretch="never")
         self.hpane.add(self.java.outer, minsize=260, stretch="always")
         self.hpane.add(self.smali.outer, minsize=260, stretch="always")
+        self._active_pane = self.smali
+        for pane in (self.java, self.smali):
+            pane.text.bind("<FocusIn>", lambda e, p=pane: setattr(self, "_active_pane", p), add="+")
+        for seq in ("<Control-f>", "<Control-F>"):     # fallback when focus is outside an editor
+            self.bind_all(seq, self._on_ctrl_f)
+        self.java.text.bind("<ButtonRelease-1>", self._on_java_click)
         self.smali.text.bind("<ButtonRelease-1>", self._on_smali_click)
         self.smali.text.bind("<KeyRelease>", self._on_smali_key)
         self.smali.text.bind("<Control-s>", lambda e: (self.cmd_save(), "break")[1])
@@ -287,7 +299,8 @@ class SmaliXApp(ctk.CTk):
     def _on_tree_select(self, path: Path, header: Optional[str]) -> None:
         self.open_file(path, header=header)
 
-    def open_file(self, path: Path, line: Optional[int] = None, header: Optional[str] = None) -> None:
+    def open_file(self, path: Path, line: Optional[int] = None, header: Optional[str] = None,
+                  refresh_java: bool = True) -> None:
         if self.current_file != path:
             if self._dirty() and messagebox.askyesno(APP_NAME, f"Save changes to {self.current_file.name}?"):
                 self.cmd_save()
@@ -306,7 +319,8 @@ class SmaliXApp(ctk.CTk):
                 return
             self.current_file = path
             self.smali.set_content(text, syntax=path.suffix == ".smali")
-            self._refresh_java(path, text)
+            if refresh_java:
+                self._refresh_java(path, text)
         if header:
             idx = self.smali.text.search(header, "1.0", stopindex="end")
             if idx:
@@ -316,6 +330,7 @@ class SmaliXApp(ctk.CTk):
 
     def _show_unreadable(self, path: Path, reason: str) -> None:
         self.current_file = None
+        self._java_owner = None
         lines = [path.name, reason]
         if path.suffix == ".xml" or path.name == "resources.arsc":
             lines += ["", "This file is still in compiled (binary) form because 'fast (code-only)' was",
@@ -335,6 +350,7 @@ class SmaliXApp(ctk.CTk):
         t.yview_moveto(max(0.0, (line - 4) / max(1, int(t.index("end-1c").split(".")[0]))))
 
     def _refresh_java(self, path: Path, text: Optional[str]) -> None:
+        self._java_owner = path if path.suffix == ".smali" else None
         if path.suffix != ".smali":
             self.java.set_content(f"// {path.name}\n// Resource / config file - edit it in the right-hand pane.")
             return
@@ -353,7 +369,24 @@ class SmaliXApp(ctk.CTk):
         if self.current_file and self.current_file.suffix == ".smali":
             self._refresh_java(self.current_file, None)
 
+    def _pane_for_focus(self) -> CodePane:
+        """Editor that owns the keyboard focus (or the one used last)."""
+        try:
+            w = str(self.focus_get())
+        except (KeyError, tk.TclError):
+            w = ""
+        for pane in (self.java, self.smali):
+            p = str(pane.outer)
+            if w == p or w.startswith(p + "."):
+                return pane
+        return self._active_pane or self.smali
+
+    def _on_ctrl_f(self, _e=None) -> str:
+        self._pane_for_focus().find.show()
+        return "break"
+
     def _on_smali_key(self, _e=None) -> None:
+        self.smali.find.schedule_refresh()        # keep open find results in sync while typing
         if self.current_file and self.current_file.suffix == ".smali":
             if self._hl_job:
                 self.after_cancel(self._hl_job)
@@ -368,6 +401,70 @@ class SmaliXApp(ctk.CTk):
         self.tabs.set_explain(line.strip(), explain_line(line))
         if self.tabs.current_name() in ("calls", "callers", "graph"):
             self._refresh_relations()
+
+    # ------------------------------------------------------------------ #
+    #  Java -> Smali synchronisation
+    # ------------------------------------------------------------------ #
+    def _on_java_click(self, e) -> None:
+        """Click in the Java view -> compute the matching smali line, scroll + blink."""
+        jt = self.java.text
+        if not self.sync_var.get() or jt.tag_ranges("sel"):   # ignore drag-selections (copying code)
+            return
+        owner = self._java_owner
+        if not owner or not owner.exists():
+            return
+        jline = int(jt.index(f"@{e.x},{e.y}").split(".")[0])
+        jt.tag_remove("curline", "1.0", "end")
+        jt.tag_add("curline", f"{jline}.0", f"{jline}.0 lineend+1c")
+
+        java_lines = self.java.get_content().split("\n")
+        smali_text = self.smali.get_content() if self.current_file == owner else read_text(owner)
+
+        def siblings() -> dict:          # Outer$Inner.smali, Outer$1.smali ... (loaded only if needed)
+            out = {}
+            for p in owner.parent.glob(owner.stem + "$*.smali"):
+                try:
+                    out[p.stem] = read_text(p).split("\n")
+                except OSError:
+                    pass
+            return out
+
+        res = map_java_to_smali(java_lines, jline, smali_text.split("\n"), siblings)
+        target = owner if not res.file_key else owner.parent / f"{res.file_key}.smali"
+        if self.current_file != target:
+            self.open_file(target, refresh_java=False)      # keeps the Java view where it is
+            if self.current_file != target:
+                return                                      # cancelled / unreadable
+        self._sync_smali_to(res.line)
+        self._blink_smali(res.block_start, res.block_end)
+        self.set_status(f"Java line {jline} \u2192 Smali line {res.line}  \u00b7  {res.note}")
+
+    def _sync_smali_to(self, line: int) -> None:
+        t = self.smali.text
+        t.tag_remove("curline", "1.0", "end")
+        t.tag_add("curline", f"{line}.0", f"{line}.0 lineend+1c")
+        t.mark_set("insert", f"{line}.0")
+        reveal_line_center(t, line)                         # centre the line in the editor
+
+    def _blink_smali(self, start: int, end: int, flashes: int = 3, interval: int = 170) -> None:
+        """Flash the smali block [start, end] a few times (temporary highlight)."""
+        t = self.smali.text
+        if self._blink_job:
+            self.after_cancel(self._blink_job)
+            self._blink_job = None
+        t.tag_configure("syncblink", background="#2563eb")
+        t.tag_raise("syncblink")
+        t.tag_raise("sel")
+
+        def step(n: int) -> None:
+            t.tag_remove("syncblink", "1.0", "end")
+            if n >= flashes * 2:
+                self._blink_job = None
+                return
+            if n % 2 == 0:
+                t.tag_add("syncblink", f"{start}.0", f"{end}.0 lineend+1c")
+            self._blink_job = self.after(interval, step, n + 1)
+        step(0)
 
     # ------------------------------------------------------------------ #
     #  Method awareness: Calls / Called by / Graph
