@@ -62,26 +62,43 @@ def _scrollbar(parent, command, orientation="vertical", bg=None):
 #  Code editor widgets
 # --------------------------------------------------------------------------- #
 class CodeText(tk.Text):
-    """tk.Text that emits <<Change>> whenever its content, cursor or view changes."""
-
-    def __init__(self, *args, **kwargs) -> None:
+    """Custom Text widget with proxy support to handle change events and prevent selection crashes."""
+    
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._orig = self._w + "_orig"
         self.tk.call("rename", self._w, self._orig)
-        self.tk.createcommand(self._w, self._proxy)
+        self.tk.createcommand(self._w, self.proxy)
 
-    def _proxy(self, *args):
-        result = self.tk.call((self._orig,) + args)
-        if args and (args[0] in ("insert", "replace", "delete")
-                     or args[0:3] == ("mark", "set", "insert")
-                     or args[0:2] in (("xview", "moveto"), ("xview", "scroll"),
-                                      ("yview", "moveto"), ("yview", "scroll"))):
-            try:
-                self.event_generate("<<Change>>", when="tail")
-            except tk.TclError:
-                pass
-        return result
-
+    def proxy(self, *args):
+        try:
+            result = self.tk.call((self._orig,) + args)
+            if args and (args[0] in ("insert", "replace", "delete")
+                         or args[0:3] == ("mark", "set", "insert")
+                         or args[0:2] in (("xview", "moveto"), ("xview", "scroll"),
+                                          ("yview", "moveto"), ("yview", "scroll"))):
+                try:
+                    self.event_generate("<<Change>>", when="tail")
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            # যদি সিলেকশন বা 'sel' ট্যাগ সংক্রান্ত কোনো এরর হয়, তবে সেটি এড়িয়ে যাবে
+            if "text doesn't contain any characters tagged with \"sel\"" in str(e):
+                return None
+            raise e
+    
+        """VS Code স্টাইলে নির্দিষ্ট কোড ব্লক কোল্যাপ্স বা এক্সপান্ড করার ফাংশন"""
+        tag_name = f"fold_{start_line}_{end_line}"
+        ranges = self.tag_ranges(tag_name)
+        if ranges:
+            # যদি অলরেডি কোল্যাপ্স করা থাকে, তবে এক্সপান্ড (show) করবে
+            self.tag_config(tag_name, elide=False)
+            self.tag_remove(tag_name, "1.0", "end")
+        else:
+            # যদি এক্সপান্ড করা থাকে, তবে কোল্যাপ্স (hide) করবে
+            self.tag_add(tag_name, f"{start_line}.0", f"{end_line}.end")
+            self.tag_config(tag_name, elide=True)
 
 class LineNumbers(tk.Canvas):
     """Line-number gutter that follows a CodeText widget."""
